@@ -1,5 +1,7 @@
 # Favorite Scenery — OpenRCT2 Plugin
 
+![Favorite Scenery plugin preview](plugin-preview.png)
+
 A plugin for [OpenRCT2](https://openrct2.io) that lets you build collections of your favorite scenery and place them quickly without hunting through the scenery menus.
 
 ## Features
