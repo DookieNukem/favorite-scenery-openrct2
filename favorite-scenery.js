@@ -1785,12 +1785,16 @@
                         }
                     }
                     if (activeWindow) {
-                        updateFavGrid(activeWindow);
-                        var statusLbl = activeWindow.findWidget("fav_status");
-                        if (statusLbl) {
-                            statusLbl.text = added.length > 0
-                                ? "Added: " + added[0] + " — click more or Esc to stop"
-                                : "No scenery here — click elsewhere or Esc to stop";
+                        if (activeWindow.tabIndex === 0) {
+                            updateFavGrid(activeWindow);
+                            var statusLbl = activeWindow.findWidget("fav_status");
+                            if (statusLbl) {
+                                statusLbl.text = added.length > 0
+                                    ? "Added: " + added[0] + " — click more or Esc to stop"
+                                    : "No scenery here — click elsewhere or Esc to stop";
+                            }
+                        } else {
+                            updateAllGrid(activeWindow);
                         }
                     }
                 } catch (ex) { /* ignore tile read errors */ }
@@ -2287,7 +2291,7 @@
 
     registerPlugin({
         name:            "Favorite Scenery",
-        version:         "1.1.1",
+        version:         "1.1.2",
         authors:         ["DookieNukem"],
         type:            "local",
         licence:         "MIT",
