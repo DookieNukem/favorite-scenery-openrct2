@@ -7,10 +7,11 @@
 
     // ---- Layout constants ----
     var GRID_COLS  = 6;
-    var GRID_ROWS  = 7;
+    var GRID_ROWS  = 5;
     var GRID_SIZE  = GRID_COLS * GRID_ROWS; // 48 buttons
-    var BTN_SIZE   = 40;
-    var THUMB_PAD  = 4;  // padding around sprite inside each button cell
+    var BTN_SIZE   = 64;      // button width (and square cell size for image slots)
+    var BTN_H      = BTN_SIZE * 1.25; // button height — taller cells give sprites more room
+    var THUMB_PAD  = 1;  // padding around sprite inside each button cell
     var BTN_GAP    = 4;
     var MARGIN     = 6;
     var WIN_WIDTH  = (GRID_COLS * BTN_SIZE) + ((GRID_COLS-1) * BTN_GAP) + 4 * MARGIN;
@@ -36,11 +37,14 @@
     var FAV_CTRL_OFF  = 26 + THUMB_PAD;
 
     // Hover label: 6px below groupbox bottom (groupbox bottom = grid bottom + 4px padding)
-    var ALL_HOVER_Y = ALL_GRID_Y + GRID_ROWS * (BTN_SIZE + BTN_GAP) - BTN_GAP + 10;
-    var FAV_HOVER_Y = FAV_GRID_Y + GRID_ROWS * (BTN_SIZE + BTN_GAP) - BTN_GAP + 10;
+    var ALL_HOVER_Y = ALL_GRID_Y + GRID_ROWS * (BTN_H + BTN_GAP) - BTN_GAP + 10;
+    var FAV_HOVER_Y = FAV_GRID_Y + GRID_ROWS * (BTN_H + BTN_GAP) - BTN_GAP + 10;
 
     // Tab 2 (Import/Export): no grid, fixed shorter height
     var IO_WIN_HEIGHT = 160;
+
+    // Bit 9 of SmallSceneryObject.flags — object has a glass overlay sprite at baseImageId+4
+    var SMALL_SCENERY_FLAG_HAS_GLASS = 0x200; // bit 9 — has glass overlay sprites
 
     // ---- Scenery type config ----
     var SCENERY_TYPES = [
@@ -102,6 +106,17 @@
         "banner":           "bannerplace"
     };
 
+    var REMOVE_ACTION_NAME = {
+        "small_scenery":    "smallsceneryremove",
+        "large_scenery":    "largesceneryremove",
+        "wall":             "wallremove",
+        "footpath_addition":"footpathadditionremove",
+        "banner":           "bannerremove"
+    };
+
+    // flags: GAME_COMMAND_FLAG_GHOST (0x40) | GAME_COMMAND_FLAG_ALLOW_DURING_PAUSED (0x08)
+    var GHOST_FLAGS = 72;
+
     var STORAGE_KEY     = "FavoriteScenery.favorites";   // legacy key (migration only)
     var COLLECTIONS_KEY = "FavoriteScenery.collections";
     var ACTIVE_COLL_KEY = "FavoriteScenery.activeCollection";
@@ -127,10 +142,13 @@
     var globalPrimaryColour   = 0;  // global placement palette — applied to every item placed
     var globalSecondaryColour = 0;
     var globalTertiaryColour  = 0;
+    var globalDirection       = 0;  // placement rotation: 0=N 1=E 2=S 3=W
     var searchText       = "";    // current search query for Tab 0
     var favSearchText    = "";    // current search query for Tab 1
     var activePlacingItem    = null;  // {type, identifier} of item currently being placed, or null
     var suppressPlacerFinish = false; // true while switching placement to suppress old tool's onFinish cleanup
+    var ghostRemoveQueue     = [];    // [{action, args}] — pre-built remove calls to undo the current ghost
+    var lastGhostPos         = null;  // {tileX, tileY, direction, quadrant} — skip re-placing if unchanged
     var ioExportCollIdx      = 0;    // Tab 2: 0 = all collections, 1+ = collections[i-1]
     var ioStatusText         = "";   // Tab 2: result of last import operation
 
@@ -193,7 +211,7 @@
                 return !(f.type === type && f.identifier === identifier);
             });
         } else {
-            collections[activeCollIdx].items.push({ type: type, identifier: identifier });
+            collections[activeCollIdx].items.unshift({ type: type, identifier: identifier });
         }
         saveCollections();
     }
@@ -328,9 +346,9 @@
 
     function updateWindowTitle(win) {
         if (!win) return;
-        if (win.tabIndex === 0) {
+        if (win.tabIndex === 1) {
             win.title = "Add Scenery to "+ collections[activeCollIdx].name + " Collection";
-        } else if (win.tabIndex === 1) {
+        } else if (win.tabIndex === 0) {
             win.title = collections[activeCollIdx].name + " Collection";
         } else {
             win.title = "Import / Export Collections";
@@ -532,42 +550,109 @@
         }
     }
 
-    function renderThumb(gridIndex, baseImageId, pc, sc, tc) {
+    function renderThumb(gridIndex, item, pc, sc, tc, dir) {
+        var baseImageId = item.obj.baseImageId;
         if (!thumbRange) return baseImageId; // fallback: raw sprite (may overflow)
         var slotId = thumbRange.start + gridIndex;
-        var failed = false;
-        try {
-            ui.imageManager.draw(slotId, { width: BTN_SIZE, height: BTN_SIZE }, function (g) {
-                var info = g.getImage(baseImageId);
-                if (!info) { failed = true; return; }
-                g.clear();
-                var inner = BTN_SIZE - THUMB_PAD * 2;
-                var drawX = THUMB_PAD + Math.floor((inner - info.width)  / 2) - info.offset.x;
-                var drawY = THUMB_PAD + Math.floor((inner - info.height) / 2) - info.offset.y;
-                g.clip(THUMB_PAD, THUMB_PAD, inner, inner);
-                if (pc !== undefined) g.colour          = pc;
-                if (sc !== undefined) g.secondaryColour = sc;
-                if (tc !== undefined) g.tertiaryColour  = tc;
-                g.image(baseImageId, drawX, drawY);
-            });
-        } catch (e) {
-            return baseImageId; // fallback if draw fails
+        // The in-game scenery window renders glass items in two passes:
+        //   1) base sprite (opaque parts)
+        //   2) glass overlay at baseImageId+4 drawn with WithTransparency(primaryColour)
+        // The plugin API's g.image() has no way to invoke the glass-blend path, so we
+        // draw the overlay with a colour remap instead — the glass area shows as a tinted
+        // shape rather than true blended glass, but at least it is visible.
+        // Small scenery: glass overlay at baseImageId+4, detected via obj.flags bit 9.
+        // Wall: glass overlay at rotatedBase+6; non-glass walls have <=6 sprites, so
+        //       numImages>6 safely guards within-object probing without needing flags.
+        var hasGlass = item.type === "small_scenery"
+                    && item.obj.flags !== undefined
+                    && (item.obj.flags & SMALL_SCENERY_FLAG_HAS_GLASS) !== 0;
+        var wallHasGlass = item.type === "wall" && item.obj.numImages > 6;
+        // Small/large scenery: directional sprites at baseImageId+0/1/2/3 (N/E/S/W).
+        // Walls: sprite 0 = N/S edge, sprite 1 = E/W edge (directions 0,2 → offset 1; 1,3 → offset 0).
+        var rotDir = (dir !== undefined && dir > 0) ? (dir % 4) : 0;
+        var rotatedBase;
+        if (item.type === "wall") {
+            rotatedBase = baseImageId + (rotDir % 2 === 0 ? 1 : 0);
+        } else if (rotDir > 0
+                && (item.type === "small_scenery" || item.type === "large_scenery")
+                && item.obj.numImages >= 4) {
+            rotatedBase = baseImageId + rotDir;
+        } else {
+            rotatedBase = baseImageId;
         }
+
+        // xAdj/yAdj: pixel-content centering corrections computed after first pass.
+        var xAdj = 0, yAdj = 0;
+        var failed = false;
+
+        function execDraw() {
+            failed = false;
+            try {
+                ui.imageManager.draw(slotId, { width: BTN_SIZE, height: BTN_H }, function (g) {
+                    var info = g.getImage(rotatedBase);
+                    if (!info) { failed = true; return; }
+                    g.clear();
+                    var innerW = BTN_SIZE - THUMB_PAD * 2;
+                    var innerH = BTN_H    - THUMB_PAD * 2;
+                    var drawX = THUMB_PAD + Math.floor((innerW - info.width)  / 2) - info.offset.x + xAdj;
+                    var drawY = THUMB_PAD + Math.floor((innerH - info.height) / 2) - info.offset.y + yAdj;
+                    g.clip(THUMB_PAD, THUMB_PAD, innerW, innerH);
+                    if (pc !== undefined) g.colour          = pc;
+                    if (sc !== undefined) g.secondaryColour = sc;
+                    if (tc !== undefined) g.tertiaryColour  = tc;
+                    g.image(rotatedBase, drawX, drawY);
+                    var glassOffset = 0;
+                    if (hasGlass) {
+                        glassOffset = 4;
+                    } else if (wallHasGlass) {
+                        glassOffset = 6;
+                    }
+                    if (glassOffset > 0) {
+                        var glassColour = pc !== undefined ? pc : 8;
+                        g.colour          = glassColour;
+                        g.secondaryColour = glassColour;
+                        g.tertiaryColour  = glassColour;
+                        g.image(rotatedBase + glassOffset, drawX, drawY);
+                    }
+                });
+            } catch (e) {
+                failed = true;
+            }
+        }
+
+        // First pass — initial centered position.
+        execDraw();
         if (failed) return baseImageId;
-        // Glass and water sprites produce all-transparent pixels in the canvas context
-        // because the engine's glass blending requires a real screen buffer. Detect this
-        // by checking if every pixel is zero (transparent palette index) and fall back to
-        // the raw sprite so the engine renders it natively against the button background.
+
+        // Analyze pixel data to find the actual non-transparent content bounding box,
+        // then re-center on that box and redraw if the correction is significant.
         try {
             var pix = ui.imageManager.getPixelData(slotId);
             if (pix && pix.type === "raw" && pix.data && pix.data.length > 0) {
-                var empty = true;
-                for (var pi = 0; pi < pix.data.length; pi++) {
-                    if (pix.data[pi] !== 0) { empty = false; break; }
+                var data = pix.data;
+                var minX = BTN_SIZE, maxX = -1, minY = BTN_H, maxY = -1;
+                for (var row = 0; row < BTN_H; row++) {
+                    for (var col = 0; col < BTN_SIZE; col++) {
+                        if (data[row * BTN_SIZE + col] !== 0) {
+                            if (col < minX) minX = col;
+                            if (col > maxX) maxX = col;
+                            if (row < minY) minY = row;
+                            if (row > maxY) maxY = row;
+                        }
+                    }
                 }
-                if (empty) return baseImageId;
+                // Completely transparent — fall back to raw sprite.
+                if (maxX < 0) return baseImageId;
+                // Compute how far the content centre deviates from the canvas centre.
+                xAdj = Math.round(BTN_SIZE / 2 - (minX + maxX) / 2);
+                yAdj = Math.round(BTN_H    / 2 - (minY + maxY) / 2);
+                if (Math.abs(xAdj) > 1 || Math.abs(yAdj) > 1) {
+                    execDraw(); // second pass with corrected position
+                    if (failed) return baseImageId;
+                }
             }
-        } catch (e) { /* can't check — use slotId */ }
+        } catch (e) { /* keep first-pass result */ }
+
         return slotId;
     }
 
@@ -586,6 +671,104 @@
         return 0;
     }
 
+    // ---- Ghost preview helpers ----
+
+    // Returns which quarter of a tile (0-3) the map coordinate falls in.
+    // Quadrant layout (looking top-down, x=east, y=south):
+    //   0=NW  3=NE
+    //   1=SW  2=SE
+    function computeQuadrant(mapX, mapY) {
+        // Replicates MapGetTileQuadrant(mapPos) ^ 2 from OpenRCT2 Scenery.cpp
+        var subX = mapX & 31;
+        var subY = mapY & 31;
+        if (subX <= 16 && subY < 16)  return 0;  // top-left
+        if (subX <= 16 && subY >= 16) return 1;  // bottom-left
+        if (subX > 16  && subY >= 16) return 2;  // bottom-right
+        return 3;                                 // top-right
+    }
+
+
+    // Replicates CoordsXY::Rotate(direction) from OpenRCT2 Location.hpp.
+    // Rotates a tile offset (in world units) by dir * 90° clockwise.
+    function rotateTileOffset(dx, dy, dir) {
+        switch (dir & 3) {
+            case 1: return { x:  dy, y: -dx };
+            case 2: return { x: -dx, y: -dy };
+            case 3: return { x: -dy, y:  dx };
+            default: return { x: dx, y: dy };
+        }
+    }
+
+    // Execute the pre-built remove queue to erase the current ghost.
+    function removeGhost() {
+        var queue = ghostRemoveQueue;
+        ghostRemoveQueue = [];
+        lastGhostPos = null;
+        for (var i = 0; i < queue.length; i++) {
+            context.executeAction(queue[i].action, queue[i].args, function () {});
+        }
+    }
+
+    // Place a ghost preview and pre-build the matching remove queue.
+    function placeGhost(item, mapX, mapY, quadrant) {
+        var wx = Math.floor(mapX / 32) * 32;
+        var wy = Math.floor(mapY / 32) * 32;
+        var z  = getGroundZ(wx, wy);
+        var q  = quadrant || 0;
+
+        var placeArgs = {
+            x:               wx,
+            y:               wy,
+            z:               z,
+            direction:       globalDirection,
+            object:          item.obj.index,
+            primaryColour:   globalPrimaryColour,
+            secondaryColour: globalSecondaryColour,
+            tertiaryColour:  globalTertiaryColour,
+            flags:           GHOST_FLAGS
+        };
+        if (item.type === "small_scenery") placeArgs.quadrant = q;
+        if (item.type === "wall")          placeArgs.edge     = globalDirection;
+
+        // Pre-build the remove queue now, while we know all the args.
+        ghostRemoveQueue = [];
+        if (item.type === "small_scenery") {
+            ghostRemoveQueue.push({
+                action: "smallsceneryremove",
+                args: { x: wx, y: wy, z: z, object: item.obj.index, quadrant: q, flags: GHOST_FLAGS }
+            });
+        } else if (item.type === "large_scenery") {
+            // largesceneryremove removes all tiles of the structure from a single call.
+            // direction is required — FindLargeSceneryElement matches GetDirection().
+            // Use tile 0 (the anchor tile) at its rotated world position.
+            var lgTiles = (item.obj.tiles && item.obj.tiles.length > 0)
+                ? item.obj.tiles : [{ offset: { x: 0, y: 0 } }];
+            var off0 = rotateTileOffset(lgTiles[0].offset.x, lgTiles[0].offset.y, globalDirection);
+            ghostRemoveQueue.push({
+                action: "largesceneryremove",
+                args: { x: wx + off0.x, y: wy + off0.y,
+                        z: z, direction: globalDirection, tileIndex: 0, flags: GHOST_FLAGS }
+            });
+        } else if (item.type === "wall") {
+            ghostRemoveQueue.push({
+                action: "wallremove",
+                args: { x: wx, y: wy, z: z, direction: globalDirection, flags: GHOST_FLAGS }
+            });
+        } else if (item.type === "footpath_addition") {
+            ghostRemoveQueue.push({
+                action: "footpathadditionremove",
+                args: { x: wx, y: wy, z: z, flags: GHOST_FLAGS }
+            });
+        } else if (item.type === "banner") {
+            ghostRemoveQueue.push({
+                action: "bannerremove",
+                args: { x: wx, y: wy, z: z, flags: GHOST_FLAGS }
+            });
+        }
+
+        context.executeAction(ACTION_NAME[item.type], placeArgs, function () {});
+    }
+
     // ---- Placement tool ----
     function activatePlacement(item) {
         ui.activateTool({
@@ -596,9 +779,9 @@
                 // Keep hover label updated while placing (hover detector is not running).
                 if (activeWindow && e.screenCoords) {
                     var tabIdx    = activeWindow.tabIndex;
-                    var gridTop   = (tabIdx === 0) ? ALL_GRID_Y : FAV_GRID_Y;
-                    var pageItems = (tabIdx === 0) ? allPageItems : favPageItems;
-                    var lblName   = (tabIdx === 0) ? "all_hover_lbl" : "fav_hover_lbl";
+                    var gridTop   = (tabIdx === 0) ? FAV_GRID_Y : ALL_GRID_Y;
+                    var pageItems = (tabIdx === 0) ? favPageItems : allPageItems;
+                    var lblName   = (tabIdx === 0) ? "fav_hover_lbl" : "all_hover_lbl";
                     var idx = hitTestGrid(e.screenCoords.x, e.screenCoords.y, gridTop);
                     var lbl = activeWindow.findWidget(lblName);
                     if (lbl) {
@@ -608,7 +791,9 @@
                             : "";
                     }
                 }
+
                 if (!e.mapCoords) {
+                    removeGhost();
                     ui.tileSelection.range = null;
                     ui.tileSelection.tiles = [];
                     return;
@@ -619,7 +804,8 @@
                 if (item.type === "large_scenery" && item.obj.tiles && item.obj.tiles.length > 0) {
                     ui.tileSelection.range = null;
                     ui.tileSelection.tiles = item.obj.tiles.map(function (t) {
-                        return { x: wx + t.offset.x, y: wy + t.offset.y };
+                        var off = rotateTileOffset(t.offset.x, t.offset.y, globalDirection);
+                        return { x: wx + off.x, y: wy + off.y };
                     });
                 } else {
                     ui.tileSelection.tiles = [];
@@ -628,22 +814,37 @@
                         rightBottom: { x: wx, y: wy }
                     };
                 }
+                // Ghost preview: only re-place if the tile, direction, or quadrant changed.
+                var tileX = wx / 32;
+                var tileY = wy / 32;
+                var q = (item.type === "small_scenery") ? computeQuadrant(e.mapCoords.x, e.mapCoords.y) : 0;
+                if (!lastGhostPos
+                        || lastGhostPos.tileX     !== tileX
+                        || lastGhostPos.tileY     !== tileY
+                        || lastGhostPos.direction !== globalDirection
+                        || lastGhostPos.quadrant  !== q) {
+                    removeGhost();
+                    placeGhost(item, wx, wy, q);
+                    lastGhostPos = { tileX: tileX, tileY: tileY, direction: globalDirection, quadrant: q };
+                }
             },
             onDown: function (e) {
+                // Remove ghost before placing permanently so there's no overlap.
+                removeGhost();
                 if (!e.mapCoords) return;
                 var z = getGroundZ(e.mapCoords.x, e.mapCoords.y);
                 var args = {
                     x:              e.mapCoords.x,
                     y:              e.mapCoords.y,
                     z:              z,
-                    direction:      0,
+                    direction:      globalDirection,
                     object:         item.obj.index,
                     primaryColour:  globalPrimaryColour,
                     secondaryColour:globalSecondaryColour,
                     tertiaryColour: globalTertiaryColour
                 };
-                if (item.type === "small_scenery") args.quadrant = 0;
-                if (item.type === "wall")          args.edge     = 0;
+                if (item.type === "small_scenery") args.quadrant = computeQuadrant(e.mapCoords.x, e.mapCoords.y);
+                if (item.type === "wall")          args.edge     = globalDirection;
 
                 context.executeAction(ACTION_NAME[item.type], args, function (result) {
                     if (!result.error) {
@@ -655,6 +856,7 @@
                 });
             },
             onFinish: function () {
+                removeGhost();
                 ui.tileSelection.range = null;
                 ui.tileSelection.tiles = [];
                 if (!suppressPlacerFinish) {
@@ -689,7 +891,7 @@
             if (!btn) continue;
             if (j < allPageItems.length) {
                 var item = allPageItems[j];
-                btn.image     = renderThumb(j, item.obj.baseImageId);
+                btn.image     = renderThumb(j, item, globalPrimaryColour, globalSecondaryColour, globalTertiaryColour, globalDirection);
                 btn.isPressed = isFav(item.type, item.obj.identifier);
                 btn.isDisabled= false;
                 btn.isVisible = true;
@@ -749,8 +951,8 @@
                     && item.type === activePlacingItem.type
                     && item.identifier === activePlacingItem.identifier;
                 if (item.available) {
-                    btn.image     = renderThumb(j, item.obj.baseImageId,
-                        globalPrimaryColour, globalSecondaryColour, globalTertiaryColour);
+                    btn.image     = renderThumb(j, item,
+                        globalPrimaryColour, globalSecondaryColour, globalTertiaryColour, globalDirection);
                     btn.isDisabled= false;
                 } else {
                     btn.image     = 0;
@@ -789,9 +991,16 @@
         // Dynamic window height: shrink/grow the "Choose Scenery" groupbox and window
         // based on how many rows are actually filled on the current page.
         var filledRows = favPageItems.length > 0 ? Math.ceil(favPageItems.length / GRID_COLS) : 0;
-        var gridH      = filledRows > 0 ? filledRows * (BTN_SIZE + BTN_GAP) - BTN_GAP : 0;
+        var gridH      = filledRows > 0 ? filledRows * (BTN_H + BTN_GAP) - BTN_GAP : 0;
         // GB3 height: title(13) + status label(12) + gap(3) + gridH + bottom padding(4)
         var gb3H = 13 + 10 + gridH;
+
+        // Empty-collection hint: show label and add one row of height so it fits
+        var collectionIsEmpty = collections[activeCollIdx].items.length === 0;
+        var emptyLbl = win.findWidget("fav_empty_lbl");
+        if (emptyLbl) emptyLbl.isVisible = collectionIsEmpty;
+        if (collectionIsEmpty) gb3H += BTN_H;
+
         var gb3Box = win.findWidget("fav_scenery_box");
         if (gb3Box) gb3Box.height = gb3H;
 
@@ -818,6 +1027,18 @@
         }
     }
 
+    // ---- Rotation direction ----
+    function rotateDirection() {
+        globalDirection = (globalDirection + 1) % 4;
+        if (activeWindow) {
+            if (activeWindow.tabIndex === 0) {
+                updateFavGrid(activeWindow);
+            } else {
+                updateAllGrid(activeWindow);
+            }
+        }
+    }
+
     // ---- Widget factory: image button grid ----
     function makeGridButtons(prefix, gridTop, onClickFn) {
         var buttons = [];
@@ -828,11 +1049,11 @@
                         type:      "button",
                         name:      prefix + idx,
                         x:         GRID_LEFT + c * (BTN_SIZE + BTN_GAP),
-                        y:         gridTop   + r * (BTN_SIZE + BTN_GAP),
+                        y:         gridTop   + r * (BTN_H    + BTN_GAP),
                         width:     BTN_SIZE,
-                        height:    BTN_SIZE,
+                        height:    BTN_H,
                         image:     0,
-                        border:    true,
+                        border:    false,
                         isDisabled:true,
                         isVisible: false,
                         onClick:   function () { onClickFn(idx); }
@@ -850,7 +1071,7 @@
 
         // Groupboxes (visual containers — must be pushed before the widgets they frame)
         w.push({ type: "groupbox", name: "all_filter_box", x: MARGIN, y: 48, width: GBWIDE, height: 52, text: "Select & Filter" });
-        w.push({ type: "groupbox", name: "all_grid_box",   x: MARGIN, y: 104, width: GBWIDE, height: 320 + MARGIN, text: "Add to Collection" });
+        w.push({ type: "groupbox", name: "all_grid_box",   x: MARGIN, y: 104, width: GBWIDE, height: (ALL_GRID_Y - 104) + GRID_ROWS * (BTN_H + BTN_GAP) - BTN_GAP + MARGIN, text: "Add to Collection" });
 
         // Pick button — spans both control rows on the left (mirrors Tab 1 layout)
         w.push({
@@ -870,7 +1091,7 @@
         w.push({
             type:   "label",
             name:   "search_lbl",
-            x:      2*MARGIN + FAV_CTRL_OFF,
+            x:      2*MARGIN + FAV_CTRL_OFF + 2,
             y:      ALL_SEARCH_Y + 2,
             width:  44,
             height: 11,
@@ -879,9 +1100,9 @@
         w.push({
             type:      "textbox",
             name:      "search_input",
-            x:         2*MARGIN + FAV_CTRL_OFF + 46,
+            x:         2*MARGIN + FAV_CTRL_OFF + 46 + 2,
             y:         ALL_SEARCH_Y,
-            width:     WIN_WIDTH - 2*MARGIN - (2*MARGIN + FAV_CTRL_OFF + 46),
+            width:     WIN_WIDTH - 2*MARGIN - (2*MARGIN + FAV_CTRL_OFF + 46 + 2) - 34,
             height:    13,
             text:      "",
             maxLength: 100,
@@ -897,7 +1118,7 @@
         w.push({
             type:          "dropdown",
             name:          "type_filter",
-            x:             2*MARGIN + FAV_CTRL_OFF,
+            x:             2*MARGIN + FAV_CTRL_OFF + 3,
             y:             ALL_CTRL_Y,
             width:         110,
             height:        13,
@@ -915,7 +1136,7 @@
         w.push({
             type:      "button",
             name:      "all_prev",
-            x:         2*MARGIN + FAV_CTRL_OFF + 115,
+            x:         2*MARGIN + FAV_CTRL_OFF + 117,
             y:         ALL_CTRL_Y,
             width:     16,
             height:    13,
@@ -931,9 +1152,9 @@
         w.push({
             type:      "label",
             name:      "all_page_lbl",
-            x:         2*MARGIN + FAV_CTRL_OFF + 131,
+            x:         2*MARGIN + FAV_CTRL_OFF + 4 + 110 + 4 + 16 + 4 + 68,
             y:         ALL_CTRL_Y + 2,
-            width:     83,
+            width:     50,
             height:    10,
             textAlign: "centred",
             text:      "Pg 1/1"
@@ -941,7 +1162,7 @@
         w.push({
             type:      "button",
             name:      "all_next",
-            x:         2*MARGIN + FAV_CTRL_OFF + 214,
+            x:         2*MARGIN - 2*FAV_CTRL_OFF + WIN_WIDTH - 16 - 4,
             y:         ALL_CTRL_Y,
             width:     16,
             height:    13,
@@ -954,6 +1175,18 @@
                     if (activeWindow) updateAllGrid(activeWindow);
                 }
             }
+        });
+        w.push({
+            type:    "button",
+            name:    "all_rotate",
+            x:       2*MARGIN - 2*FAV_CTRL_OFF + WIN_WIDTH, 
+            y:       ALL_SEARCH_Y,
+            width:   30,
+            height:  ALL_CTRL_Y + 13 - ALL_SEARCH_Y,
+            image:   "rotate_arrow",
+            border:  true,
+            tooltip: "Rotate direction clockwise",
+            onClick: rotateDirection
         });
 
         // Image button grid
@@ -1006,7 +1239,7 @@
             name:          "fav_coll_select",
             x:             2*MARGIN,
             y:             FAV_COLL_Y,
-            width:         154,
+            width:         WIN_WIDTH - 2*MARGIN - 28 - 4 - 50 - 4 - 22 - 4 - 2*MARGIN,
             height:        13,
             items:         collections.map(function (c) { return c.name; }),
             selectedIndex: activeCollIdx,
@@ -1020,7 +1253,7 @@
         w.push({
             type:      "button",
             name:      "fav_coll_new",
-            x:         2*MARGIN + 156,
+            x:         WIN_WIDTH - 2*MARGIN - 28 - 4 - 50 - 4 - 22,
             y:         FAV_COLL_Y,
             width:     22,
             height:    13,
@@ -1030,7 +1263,7 @@
         w.push({
             type:      "button",
             name:      "fav_coll_rename",
-            x:         2*MARGIN + 180,
+            x:         WIN_WIDTH - 2*MARGIN - 28 - 4 - 50,
             y:         FAV_COLL_Y,
             width:     50,
             height:    13,
@@ -1040,7 +1273,7 @@
         w.push({
             type:       "button",
             name:       "fav_coll_delete",
-            x:          2*MARGIN + 232,
+            x:          WIN_WIDTH - 2*MARGIN - 28,
             y:          FAV_COLL_Y,
             width:      28,
             height:     13,
@@ -1049,6 +1282,7 @@
             onClick:    function () { showDeleteCollectionConfirm(); }
         });
 
+/*
         // Pick button — spans both control rows on the left
         w.push({
             type:    "button",
@@ -1062,12 +1296,13 @@
             tooltip: "Pick Scenery",
             onClick: activatePicker
         });
+*/
 
         // Search field (shifted right by FAV_CTRL_OFF)
         w.push({
             type:   "label",
             name:   "fav_search_lbl",
-            x:      2*MARGIN + FAV_CTRL_OFF,
+            x:      2*MARGIN,
             y:      FAV_SEARCH_Y + 2,
             width:  44,
             height: 11,
@@ -1076,9 +1311,9 @@
         w.push({
             type:      "textbox",
             name:      "fav_search_input",
-            x:         2*MARGIN + FAV_CTRL_OFF + 46,
+            x:         2*MARGIN  + 46,
             y:         FAV_SEARCH_Y,
-            width:     WIN_WIDTH - 2*MARGIN - FAV_CTRL_OFF - 46 - 2*MARGIN,
+            width:     WIN_WIDTH - 2*MARGIN - 46 - 2*MARGIN - 34,
             height:    13,
             text:      "",
             maxLength: 100,
@@ -1093,9 +1328,9 @@
         w.push({
             type:          "dropdown",
             name:          "fav_type_filter",
-            x:             2*MARGIN + FAV_CTRL_OFF,
+            x:             2*MARGIN,
             y:             FAV_TYPE_Y,
-            width:         110,
+            width:         110 + FAV_CTRL_OFF + 3,
             height:        13,
             items:         FAV_TYPE_LABELS,
             selectedIndex: 0,
@@ -1117,12 +1352,11 @@
             text:  "Click a favorite to start placing"
         });
         */
-
         // Prev / page label / next (same row as dropdown, shifted right by FAV_CTRL_OFF)
         w.push({
             type:      "button",
             name:      "fav_prev",
-            x:         2*MARGIN + FAV_CTRL_OFF + 115,
+            x:         2*MARGIN + FAV_CTRL_OFF + 117,
             y:         FAV_TYPE_Y,
             width:     16,
             height:    13,
@@ -1138,9 +1372,9 @@
         w.push({
             type:      "label",
             name:      "fav_page_lbl",
-            x:         2*MARGIN + FAV_CTRL_OFF + 131,
+            x:         2*MARGIN + FAV_CTRL_OFF + 4 + 110 + 4 + 16 + 4 + 68,
             y:         FAV_TYPE_Y + 2,
-            width:     83,
+            width:     50,
             height:    10,
             text:      "Pg 1/1",
             textAlign: "centred"
@@ -1148,7 +1382,7 @@
         w.push({
             type:      "button",
             name:      "fav_next",
-            x:         2*MARGIN + FAV_CTRL_OFF + 214,
+            x:         2*MARGIN - 2*FAV_CTRL_OFF + WIN_WIDTH - 16 - 4,
             y:         FAV_TYPE_Y,
             width:     16,
             height:    13,
@@ -1179,6 +1413,18 @@
                 }
             }
         });
+        w.push({
+            type:    "button",
+            name:    "fav_rotate",
+            x:       2*MARGIN - 2*FAV_CTRL_OFF + WIN_WIDTH, 
+            y:       FAV_SEARCH_Y,
+            width:   30,
+            height:  FAV_TYPE_Y + 13 - FAV_SEARCH_Y,
+            image:   "rotate_arrow",
+            border:  true,
+            tooltip: "Rotate direction clockwise",
+            onClick: rotateDirection
+        });
 
         // Image button grid
         var btns = makeGridButtons("favbtn_", FAV_GRID_Y, function (i) {
@@ -1200,6 +1446,7 @@
             // Switch to (or start) placement — suppress the old tool's onFinish cleanup
             // so it doesn't wipe activePlacingItem we're about to set.
             // Also clear needHoverRestart so the onUpdate tick doesn't cancel the new tool.
+            hoveredFavItem = item; // keep in sync so Remove button works without needing a hover pass
             suppressPlacerFinish = true;
             activePlacingItem = { type: item.type, identifier: item.identifier };
             activatePlacement(item);
@@ -1216,6 +1463,19 @@
         });
         for (var bi = 0; bi < btns.length; bi++) w.push(btns[bi]);
 
+        // Empty-collection hint label — shown centred in the grid area when collection has no items
+        w.push({
+            type:      "label",
+            name:      "fav_empty_lbl",
+            x:         MARGIN + 2,
+            y:         FAV_GRID_Y + Math.floor((BTN_H - 13) / 2),
+            width:     WIN_WIDTH - MARGIN * 2 - 4,
+            height:    13,
+            text:      "Add to this collection using the scenery tab",
+            textAlign: "centred",
+            isVisible: false
+        });
+
         // Hover row: item name label | 3 colour pickers | Remove button
         w.push({
             type:   "label",
@@ -1230,7 +1490,7 @@
         w.push({
             type:       "colourpicker",
             name:       "fav_color_1",
-            x:          MARGIN + 158,
+            x:          WIN_WIDTH - 70 - MARGIN - 2 - 12 - 2 - 12 - 2 - 12 - 2,
             y:          FAV_HOVER_Y,
             width:      12,
             height:     12,
@@ -1246,7 +1506,7 @@
         w.push({
             type:       "colourpicker",
             name:       "fav_color_2",
-            x:          MARGIN + 172,
+            x:          WIN_WIDTH - 70 - MARGIN - 2 - 12 - 2 - 12 - 2,
             y:          FAV_HOVER_Y,
             width:      12,
             height:     12,
@@ -1262,7 +1522,7 @@
         w.push({
             type:       "colourpicker",
             name:       "fav_color_3",
-            x:          MARGIN + 186,
+            x:          WIN_WIDTH - 70 - MARGIN - 2 - 12 - 2,
             y:          FAV_HOVER_Y,
             width:      12,
             height:     12,
@@ -1278,9 +1538,9 @@
         w.push({
             type:      "button",
             name:      "fav_remove_btn",
-            x:         MARGIN + 201,
+            x:         WIN_WIDTH - 70 - MARGIN,
             y:         FAV_HOVER_Y,
-            width:     WIN_WIDTH - MARGIN - (MARGIN + 201),
+            width:     70,
             height:    13,
             text:      "Remove",
             isDisabled:true,
@@ -1304,7 +1564,7 @@
             onMove: function (e) {
                 if (!activeWindow) return;
                 var tabIdx  = activeWindow.tabIndex;
-                var lblName = (tabIdx === 0) ? "all_hover_lbl" : "fav_hover_lbl";
+                var lblName = (tabIdx === 0) ? "fav_hover_lbl" : "all_hover_lbl";
                 var lbl = activeWindow.findWidget(lblName);
                 if (!lbl) return;
 
@@ -1338,8 +1598,8 @@
 
                 // When over the window, fall back to grid button hit-test.
                 if (e.screenCoords) {
-                    var gridTop   = (tabIdx === 0) ? ALL_GRID_Y : FAV_GRID_Y;
-                    var pageItems = (tabIdx === 0) ? allPageItems : favPageItems;
+                    var gridTop   = (tabIdx === 0) ? FAV_GRID_Y : ALL_GRID_Y;
+                    var pageItems = (tabIdx === 0) ? favPageItems : allPageItems;
                     var idx = hitTestGrid(e.screenCoords.x, e.screenCoords.y, gridTop);
                     var hi  = (idx >= 0 && idx < pageItems.length) ? pageItems[idx] : null;
                     lbl.text = hi
@@ -1402,16 +1662,16 @@
                     if (b0) b0.isPressed = false;
                     if (b1) b1.isPressed = false;
                     if (activeWindow.tabIndex === 0) {
-                        updateAllGrid(activeWindow);
-                    } else {
                         updateFavGrid(activeWindow);
+                    } else {
+                        updateAllGrid(activeWindow);
                     }
                 }
                 needHoverRestart = true; // restart on next onUpdate tick (avoids tool re-entrancy)
             }
         });
         if (activeWindow) {
-            var pickName = (activeWindow.tabIndex === 0) ? "all_pick" : "fav_pick";
+            var pickName = (activeWindow.tabIndex === 0) ? "fav_pick" : "all_pick";
             var btn = activeWindow.findWidget(pickName);
             if (btn) btn.isPressed = true;
             var statusLbl = activeWindow.findWidget("fav_status");
@@ -1433,12 +1693,12 @@
         var relY = localY - gridTop;
         if (relX < 0 || relY < 0) return -1;
         var col = Math.floor(relX / (BTN_SIZE + BTN_GAP));
-        var row = Math.floor(relY / (BTN_SIZE + BTN_GAP));
+        var row = Math.floor(relY / (BTN_H    + BTN_GAP));
         if (col >= GRID_COLS || row >= GRID_ROWS) return -1;
         // Ensure cursor is inside the button itself, not in the gap between buttons
         var inBtnX = relX - col * (BTN_SIZE + BTN_GAP);
-        var inBtnY = relY - row * (BTN_SIZE + BTN_GAP);
-        if (inBtnX >= BTN_SIZE || inBtnY >= BTN_SIZE) return -1;
+        var inBtnY = relY - row * (BTN_H    + BTN_GAP);
+        if (inBtnX >= BTN_SIZE || inBtnY >= BTN_H) return -1;
         return row * GRID_COLS + col;
     }
 
@@ -1456,9 +1716,9 @@
                 var sc = e.screenCoords;
                 if (!sc) return;
                 var tabIdx    = activeWindow.tabIndex;
-                var gridTop   = (tabIdx === 0) ? ALL_GRID_Y   : FAV_GRID_Y;
-                var pageItems = (tabIdx === 0) ? allPageItems : favPageItems;
-                var lblName   = (tabIdx === 0) ? "all_hover_lbl" : "fav_hover_lbl";
+                var gridTop   = (tabIdx === 0) ? FAV_GRID_Y   : ALL_GRID_Y;
+                var pageItems = (tabIdx === 0) ? favPageItems : allPageItems;
+                var lblName   = (tabIdx === 0) ? "fav_hover_lbl" : "all_hover_lbl";
                 var idx = hitTestGrid(sc.x, sc.y, gridTop);
                 var lbl = activeWindow.findWidget(lblName);
                 if (!lbl) return;
@@ -1468,11 +1728,12 @@
                         ? (hoveredItem.obj.name || hoveredItem.obj.identifier || "")
                         : (hoveredItem.identifier || ""))
                     : "";
-                if (tabIdx === 1) {
-                    hoveredFavItem = hoveredItem;
-                    var isRecent  = FAV_TYPE_VALUES[favTypeIdx] === "recent";
-                    var removeBtn = activeWindow.findWidget("fav_remove_btn");
-                    //if (removeBtn) removeBtn.isDisabled = (!hoveredItem || isRecent);
+                if (tabIdx === 0) {
+                    // Only update when a valid item is under the cursor so hoveredFavItem
+                    // remains valid when the user moves to click the Remove button.
+                    if (hoveredItem !== null) {
+                        hoveredFavItem = hoveredItem;
+                    }
                 }
             },
             onFinish: function () { /* other code restarts as needed */ }
@@ -1513,16 +1774,17 @@
                     text:    "Remove",
                     onClick: function () {
                         toggleFav(item.type, item.identifier);
-                        if (hoveredFavItem === item) {
-                            hoveredFavItem = null;
-                            if (activeWindow) {
-                                var rb = activeWindow.findWidget("fav_remove_btn");
-                                if (rb) rb.isDisabled = true;
-                                var hl = activeWindow.findWidget("fav_hover_lbl");
-                                if (hl) hl.text = "";
-                            }
+                        hoveredFavItem = null;
+                        if (activeWindow) {
+                            var rb = activeWindow.findWidget("fav_remove_btn");
+                            if (rb) rb.isDisabled = true;
+                            var hl = activeWindow.findWidget("fav_hover_lbl");
+                            if (hl) hl.text = "";
                         }
-                        if (activeWindow) updateFavGrid(activeWindow);
+                        if (activeWindow) {
+                            updateFavGrid(activeWindow);
+                            updateFavButtonPressedStates(activeWindow);
+                        }
                         try {
                             var w = ui.getWindow("fav-remove-confirm");
                             if (w) w.close();
@@ -1722,7 +1984,6 @@
             ]
         });
     }
-
     // ---- Window descriptor ----
     function buildWindowDesc() {
         return {
@@ -1732,12 +1993,12 @@
             height:         ALL_HOVER_Y + 20, // initial height for Tab 0; resized by onTabChange
             tabs: [
                 {
-                    image:   5465,
-                    widgets: buildTab0Widgets()
-                },
-                {
                     image:   "awards",
                     widgets: buildTab1Widgets()
+                },
+                {
+                    image:   "scenery",
+                    widgets: buildTab0Widgets()
                 },
                 {
                     image:   "floppy_disk",
@@ -1759,13 +2020,13 @@
                     ui.tool.cancel();
                 }
                 if (activeWindow.tabIndex === 0) {
-                    activeWindow.height = ALL_HOVER_Y + 20;
-                    hoveredFavItem = null;
-                    updateAllGrid(activeWindow);
-                } else if (activeWindow.tabIndex === 1) {
                     // Height is set dynamically by updateFavGrid based on filled rows
                     refreshCollectionDropdown(activeWindow);
                     updateFavGrid(activeWindow);
+                } else if (activeWindow.tabIndex === 1) {
+                    activeWindow.height = ALL_HOVER_Y + 20;
+                    hoveredFavItem = null;
+                    updateAllGrid(activeWindow);
                 } else {
                     // Tab 2: Import / Export
                     activeWindow.height = IO_WIN_HEIGHT;
@@ -1776,6 +2037,7 @@
                     if (statusLbl) statusLbl.text = ioStatusText;
                 }
             },
+            
             onClose: function () {
                 activeWindow = null; // clear first so onFinish callbacks see no window
                 if (ui.tool && (ui.tool.id === "fav-scenery-placer" ||
@@ -1803,6 +2065,15 @@
         initThumbs();
         filteredCatalog = buildCatalog("all");
 
+        ui.registerShortcut({
+            id:       "favorite-scenery.rotate",
+            text:     "Favorite Scenery: Rotate placement direction",
+            bindings: ["Z"],
+            callback: rotateDirection
+        });
+
+
+
         ui.registerMenuItem("Favorite Scenery", function () {
             // Bring existing window to front if open
             try {
@@ -1821,15 +2092,16 @@
 
             var win = ui.openWindow(buildWindowDesc());
             activeWindow = win;
-            updateAllGrid(win);
+            refreshCollectionDropdown(win);
+            updateFavGrid(win);
             activateHoverTool();
         });
     }
 
     registerPlugin({
         name:            "Favorite Scenery",
-        version:         "1.0.0",
-        authors:         ["OpenRCT2 User"],
+        version:         "1.0.1",
+        authors:         ["DookieNukem"],
         type:            "local",
         licence:         "MIT",
         targetApiVersion:110,
@@ -1837,3 +2109,4 @@
     });
 
 })();
+
