@@ -1409,7 +1409,6 @@
             onClick:    function () { showDeleteCollectionConfirm(); }
         });
 
-/*
         // Pick button — spans both control rows on the left
         w.push({
             type:    "button",
@@ -1423,13 +1422,12 @@
             tooltip: "Pick Scenery",
             onClick: activatePicker
         });
-*/
 
-        // Search field (shifted right by FAV_CTRL_OFF)
+        // Search field (shifted right by FAV_CTRL_OFF to clear pick button)
         w.push({
             type:   "label",
             name:   "fav_search_lbl",
-            x:      2*MARGIN,
+            x:      2*MARGIN + FAV_CTRL_OFF + 2,
             y:      FAV_SEARCH_Y + 2,
             width:  44,
             height: 11,
@@ -1438,9 +1436,9 @@
         w.push({
             type:      "textbox",
             name:      "fav_search_input",
-            x:         2*MARGIN  + 46,
+            x:         2*MARGIN + FAV_CTRL_OFF + 46 + 2,
             y:         FAV_SEARCH_Y,
-            width:     WIN_WIDTH - 2*MARGIN - 46 - 2*MARGIN - 34 - 138,
+            width:     WIN_WIDTH - 2*MARGIN - (2*MARGIN + FAV_CTRL_OFF + 46 + 2) - 34 - 138,
             height:    13,
             text:      "",
             maxLength: 100,
@@ -1468,13 +1466,13 @@
             }
         });
 
-        // Group filter dropdown — now spans full ctrl row width
+        // Group filter dropdown — shifted right to clear pick button
         w.push({
             type:          "dropdown",
             name:          "fav_group_filter",
-            x:             2*MARGIN,
+            x:             2*MARGIN + FAV_CTRL_OFF + 3,
             y:             FAV_TYPE_Y,
-            width:         232,
+            width:         202,
             height:        13,
             items:         buildGroupDropdownItems(),
             selectedIndex: 0,
