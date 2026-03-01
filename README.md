@@ -1,6 +1,6 @@
 # Favorite Scenery — OpenRCT2 Plugin
 
-![Favorite Scenery plugin preview](plugin-preview.png)
+![Favorite Scenery plugin preview](cover-image.png)
 
 A plugin for [OpenRCT2](https://openrct2.io) that lets you build collections of your favorite scenery and place them quickly without hunting through the scenery menus.
 
@@ -30,19 +30,7 @@ A plugin for [OpenRCT2](https://openrct2.io) that lets you build collections of 
 
 ## How to Use
 
-### First Tab — All Scenery
-
-This tab shows every scenery object loaded in the current scenario. Use it to build your favorites collection.
-
-| Control | Action |
-|---------|--------|
-| Search box | Filter items by name or identifier |
-| Type dropdown | Narrow down to a specific scenery category |
-| `<` / `>` buttons | Navigate between pages |
-| **Click** a tile | Toggle the item in/out of your active collection (pressed = favorited) |
-| **Eyedropper** button | Activate the map picker — click placed scenery on the map to toggle it as a favorite |
-
-### Second Tab — Favorites
+### First Tab — Favorites
 
 This tab shows the items saved in your active collection. Use it to place your favorites.
 
@@ -57,6 +45,18 @@ This tab shows the items saved in your active collection. Use it to place your f
 | **Click** a tile | Activate the placement tool for that item — click again to cancel |
 | **Eyedropper** button | Activate the map picker — click placed scenery on the map to add it to your collection |
 | **Remove** button | Hover over a tile to enable it, then click to remove that item from the collection |
+
+### Second Tab — All Scenery
+
+This tab shows every scenery object loaded in the current scenario. Use it to build your favorites collection.
+
+| Control | Action |
+|---------|--------|
+| Search box | Filter items by name or identifier |
+| Type dropdown | Narrow down to a specific scenery category |
+| `<` / `>` buttons | Navigate between pages |
+| **Click** a tile | Toggle the item in/out of your active collection (pressed = favorited) |
+| **Eyedropper** button | Activate the map picker — click placed scenery on the map to toggle it as a favorite |
 
 #### Color Palette
 
