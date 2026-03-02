@@ -41,7 +41,7 @@
     var FAV_HOVER_Y = FAV_GRID_Y + GRID_ROWS * (BTN_H + BTN_GAP) - BTN_GAP + 10;
 
     // Tab 2 (Import/Export): no grid, fixed shorter height
-    var IO_WIN_HEIGHT = 160;
+    var IO_WIN_HEIGHT = 210;
 
     // Bit 9 of SmallSceneryObject.flags — object has a glass overlay sprite at baseImageId+4
     var SMALL_SCENERY_FLAG_HAS_GLASS = 0x200; // bit 9 — has glass overlay sprites
@@ -155,6 +155,8 @@
     var lastGhostPos         = null;  // {tileX, tileY, direction, quadrant} — skip re-placing if unchanged
     var ioExportCollIdx      = 0;    // Tab 2: 0 = all collections, 1+ = collections[i-1]
     var ioStatusText         = "";   // Tab 2: result of last import operation
+    var ioEnableCollIdx      = 0;    // Tab 2: 0 = all collections, 1+ = collections[i-1]
+    var ioEnableStatusText   = "";   // Tab 2: result of last enable operation
 
     // ---- Storage helpers ----
     function loadData() {
@@ -405,12 +407,29 @@
         return items;
     }
 
+    function buildEnableDropdownItems() {
+        var items = ["All Collections", "Recent Items"];
+        for (var i = 0; i < collections.length; i++) {
+            items.push(collections[i].name);
+        }
+        return items;
+    }
+
     function refreshIoCollDropdown(win) {
+        var items = buildExportDropdownItems();
         var dd = win.findWidget("io_coll_select");
-        if (!dd) return;
-        dd.items = buildExportDropdownItems();
-        if (ioExportCollIdx >= dd.items.length) ioExportCollIdx = 0;
-        dd.selectedIndex = ioExportCollIdx;
+        if (dd) {
+            dd.items = items;
+            if (ioExportCollIdx >= items.length) ioExportCollIdx = 0;
+            dd.selectedIndex = ioExportCollIdx;
+        }
+        var dd2 = win.findWidget("io_enable_coll_select");
+        if (dd2) {
+            var enableItems = buildEnableDropdownItems();
+            dd2.items = enableItems;
+            if (ioEnableCollIdx >= enableItems.length) ioEnableCollIdx = 0;
+            dd2.selectedIndex = ioEnableCollIdx;
+        }
     }
 
     function exportCollections(exportIdx) {
@@ -467,6 +486,37 @@
         var msg = addedColls > 0
             ? addedColls + " new collection" + (addedColls !== 1 ? "s" : "") + ", " + addedItems + " item" + (addedItems !== 1 ? "s" : "") + " added"
             : addedItems + " new item" + (addedItems !== 1 ? "s" : "") + " merged";
+        return msg;
+    }
+
+    function enableObjectsFromCollections(collIdx) {
+        var seen = {};
+        var unique = [];
+        if (collIdx === 1) {
+            // Recent Items
+            for (var ri = 0; ri < recentItems.length; ri++) {
+                var id = recentItems[ri].identifier;
+                if (!seen[id]) { seen[id] = true; unique.push(id); }
+            }
+        } else {
+            var toEnable = (collIdx === 0) ? collections : [collections[collIdx - 2]];
+            for (var ci = 0; ci < toEnable.length; ci++) {
+                var items = toEnable[ci].items;
+                for (var ii = 0; ii < items.length; ii++) {
+                    var id = items[ii].identifier;
+                    if (!seen[id]) { seen[id] = true; unique.push(id); }
+                }
+            }
+        }
+        if (unique.length === 0) return "No items in selected collection(s)";
+        var results = objectManager.load(unique);
+        var loaded = 0, failed = 0;
+        for (var r = 0; r < results.length; r++) {
+            if (results[r] !== null) loaded++;
+            else failed++;
+        }
+        var msg = loaded + " object" + (loaded !== 1 ? "s" : "") + " enabled";
+        if (failed > 0) msg += ", " + failed + " not installed locally";
         return msg;
     }
 
@@ -553,6 +603,44 @@
 
         // Status label — shows result of last import
         w.push({ type: "label", name: "io_status", x: MARGIN, y: 137, width: GBWIDE, height: 12, text: ioStatusText });
+
+        // Enable Objects groupbox
+        var isMultiplayer = (network.mode !== "none");
+        w.push({ type: "groupbox", name: "io_enable_box", x: MARGIN, y: 142, width: GBWIDE, height: 42, text: "Enable Objects from Collection" });
+        w.push({ type: "label", name: "io_enable_lbl", x: INNER, y: 166, width: 68, height: 12, text: "Collection:" });
+        w.push({
+            type:          "dropdown",
+            name:          "io_enable_coll_select",
+            x:             INNER + 70,
+            y:             165,
+            width:         dropW,
+            height:        13,
+            items:         buildEnableDropdownItems(),
+            selectedIndex: ioEnableCollIdx,
+            onChange:      function (idx) { ioEnableCollIdx = idx; }
+        });
+        w.push({
+            type:       "button",
+            name:       "io_enable_btn",
+            x:          WIN_WIDTH - MARGIN - 56,
+            y:          164,
+            width:      50,
+            height:     14,
+            text:       "Enable",
+            isDisabled: isMultiplayer,
+            onClick:    function () {
+                var result = enableObjectsFromCollections(ioEnableCollIdx);
+                ioEnableStatusText = result;
+                if (activeWindow) {
+                    var lbl = activeWindow.findWidget("io_enable_status");
+                    if (lbl) lbl.text = result;
+                }
+            }
+        });
+
+        // Enable status label
+        w.push({ type: "label", name: "io_enable_status", x: MARGIN, y: 188, width: GBWIDE, height: 12,
+                 text: isMultiplayer ? "Not available in multiplayer" : ioEnableStatusText });
 
         return w;
     }
@@ -2289,7 +2377,7 @@
 
     registerPlugin({
         name:            "Favorite Scenery",
-        version:         "1.1.2",
+        version:         "1.2.1",
         authors:         ["DookieNukem"],
         type:            "local",
         licence:         "MIT",
