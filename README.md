@@ -101,6 +101,7 @@ Shortcuts are customizable in-game via **Options → Keyboard Shortcuts → Favo
 ## Requirements
 
 - OpenRCT2 v0.4.x or later (plugin API support required)
+- 
 
 ## License
 
